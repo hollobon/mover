@@ -1,39 +1,109 @@
-# Copyright (C) Peter Hollobon 2005
-# 
+"""
+Copyright (C) Peter Hollobon <pete@hollobon.com> 2005
 
-import pyHook
-import win32api
+Some changes by Martin Dengler <martin@martindengler.com> 2006-12
+"""
+
+# pylint: disable-msg=C0103
+# pylint: disable-msg=C0111
+
+# pylint: disable-msg=W0212
+# pylint: disable-msg=W0622
+# pylint: disable-msg=W0703
+# pylint: disable-msg=W6501
+
+import time
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
 import ctypes
-from ctypes import wintypes
-import win32gui
+import pyHook
+import pythoncom
+import win32api
 import win32con
+import win32gui
+
+
 
 byref = ctypes.byref
-user32 = ctypes.windll.user32
+user = ctypes.windll.user32
+kernel = ctypes.windll.kernel32
+
+OpenDesktop = user.OpenDesktopA
+OpenInputDesktop = user.OpenInputDesktop
+SwitchDesktop = user.SwitchDesktop
+GetTopWindow = user.GetTopWindow
+DESKTOP_SWITCHDESKTOP = 0x0100
 
 _leftMouseButtonDown = False
+_middleMouseButtonDown = False
 _rightMouseButtonDown = False
-_altKeyDown = False
-_moving = False
-_windowHandle = 0
-_no_resize_window_titles = ['Extension Manager']
 
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int)]
+_moving = False
+
+snapToScreenEdges = True
+snapToScreenEdgesThreshold = 30
+snapToWindowEdges = True
+snapToWindowEdgesThreshold = 10
+
+
+key_frequencies = {}
+key_frequencies_path = r"c:\temp\keyfrequencies.txt"
+
+
+def dump_keyfreqs():
+    fh = open(key_frequencies_path, "a")
+    today = time.strftime("%Y%m%d", time.localtime())
+    for key, freq in key_frequencies.iteritems():
+        fh.write("%s,%s,%s\n" % (today, key, freq))
+    fh.flush()
+    fh.close()
+    key_frequencies.clear()
+
 
 class RECT(ctypes.Structure):
-    _fields_ = ("a", POINT), ("b", POINT)
-      
+    _fields_ = [
+        ('left', ctypes.c_long),
+        ('top', ctypes.c_long),
+        ('right', ctypes.c_long),
+        ('bottom', ctypes.c_long)
+        ]
+    def dump(self):
+        return map(int, (self.left, self.top, self.right, self.bottom))
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', ctypes.c_ulong),
+        ('rcMonitor', RECT),
+        ('rcWork', RECT),
+        ('dwFlags', ctypes.c_ulong)
+      ]
+
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("flags", ctypes.c_ulong),
+        ("hwndActive", ctypes.c_ulong),
+        ("hwndFocus", ctypes.c_ulong),
+        ("hwndCapture", ctypes.c_ulong),
+        ("hwndMenuOwner", ctypes.c_ulong),
+        ("hwndMoveSize", ctypes.c_ulong),
+        ("hwndCaret", ctypes.c_ulong),
+        ("rcCaret", RECT)
+      ]
+
+
 class TITLEBARINFO(ctypes.Structure):
     _fields_ = [
-        ("cbSize", ctypes.c_uint), 
-        ("rcTitleBar", RECT), 
+        ("cbSize", ctypes.c_uint),
+        ("rcTitleBar", RECT),
         ("rgstate", ctypes.c_uint * 6)
     ]
 
 class WINDOWINFO(ctypes.Structure):
     _fields_ = [
-        ("cbSize", ctypes.c_uint), 
+        ("cbSize", ctypes.c_uint),
         ("rcWindow", RECT),
         ("rcClient", RECT),
         ("dwStyle", ctypes.c_uint),
@@ -45,154 +115,571 @@ class WINDOWINFO(ctypes.Structure):
         ("wCreatorVersion", ctypes.c_ushort),
     ]
 
+
+
 def get_titlebar_size(windowHandle):
     tbi = TITLEBARINFO()
-    tbi.cbSize = ctypes.sizeof(TITLEBARINFO)
-    user32.GetTitleBarInfo(windowHandle, byref(tbi))
+    #tbi.cbSize = ctypes.sizeof(TITLEBARINFO)
+    user.GetTitleBarInfo(windowHandle, byref(tbi))
     win32api.FormatMessage(win32api.GetLastError())
 
     return (tbi.rcTitleBar.b.x - tbi.rcTitleBar.a.x, tbi.rcTitleBar.b.y - tbi.rcTitleBar.a.y)
 
+
 def get_border_size(windowHandle):
     wi = WINDOWINFO()
     wi.cbSize = ctypes.sizeof(WINDOWINFO)
-    user32.GetWindowInfo(windowHandle, byref(wi))
+    user.GetWindowInfo(windowHandle, byref(wi))
 
     return wi.cxWindowBorders, wi.cyWindowBorders
     #return wi.rcClient.a.x - wi.r
 
+
 def is_movable_window(windowHandle):
-    return  win32gui.IsWindowVisible(windowHandle) and \
-            win32gui.GetWindowText(windowHandle) != ""
+    wi = WINDOWINFO()
+    wi.cbSize = ctypes.sizeof(WINDOWINFO)
+    user.GetWindowInfo(windowHandle, byref(wi))
+    return win32gui.IsWindowVisible(windowHandle) and (wi.dwStyle & win32con.WS_CHILDWINDOW == 0)
 
-class mover(object):    
-  def __init__(self):
-    self.hm = pyHook.HookManager()
 
-    # register two callbacks
-    self.hm.MouseAllButtons = self.OnMouseClick
-    self.hm.KeyDown = self.OnKeyboardEvent
-    self.hm.KeyUp = self.OnKeyboardEvent
-#    self.hm.KeyAll = self.OnKeyboardAll
+def get_top_window(windowHandle):
+    while not is_movable_window(windowHandle) and win32gui.GetParent(windowHandle):
+        try:
+            windowHandle = win32gui.GetParent(windowHandle)
+        except Exception, msg_:
+            break
+    return windowHandle
 
-    # hook into the mouse and keyboard events
-    self.hm.HookMouse()
-    self.hm.HookKeyboard()
 
-  def OnMouseClick(self, event):
-    global _leftMouseButtonDown, _rightMouseButtonDown, _windowHandle, _clientPos, _xrp, _yrp, _originalPos, _windowSize, _windowPos
+def all_in_class(winclass):
+    retval = []
+    last_wh = win32con.NULL
+    while True:
+        #logging.info("%s %s " % (last_wh, winclass))
+        try:
+            last_wh = win32gui.FindWindowEx(win32con.NULL, last_wh, winclass, None)
+            retval.append(last_wh)
+            #logging.info("\tgot %s - %s" % (last_wh, win32gui.GetWindowText(last_wh)))
+            if last_wh == win32con.NULL:
+                break
+        except Exception, msg_:
+            break
+    return retval
 
-    if event.MessageName.startswith("mouse") and event.MessageName.endswith("down"):
-        if event.MessageName == 'mouse left down':
-            _leftMouseButtonDown = True
-        if event.MessageName == 'mouse right down':
-            _rightMouseButtonDown = True
-            
-        if _altKeyDown:
-            windowHandle = win32gui.WindowFromPoint(event.Position)
 
-            #wp = win32gui.GetWindowPlacement(windowHandle)
+def primary_monitor_info():
+    r = RECT()
+    user.SystemParametersInfoA(win32con.SPI_GETWORKAREA, 0, ctypes.byref(r), 0)
+    logging.info("primary_monitor_info(): got %s", r.dump())
+    return (map(int, (r.left, r.top, r.right, r.bottom)))
 
-            #while not is_movable_window(windowHandle) and win32gui.GetParent(windowHandle):
-            while win32gui.GetParent(windowHandle):
-                try:
-                    windowHandle = win32gui.GetParent(windowHandle)
-                except:
-                    break
-                    
-            _windowHandle = windowHandle
-            _originalPos = event.Position
-            _clientPos = win32gui.ScreenToClient(_windowHandle, _originalPos)
-            windowRect = win32gui.GetWindowRect(_windowHandle)
-            _windowSize = (windowRect[2] - windowRect[0], windowRect[3] - windowRect[1])
-            _windowPos = windowRect[0:2]
 
-            _xrp =  _clientPos[0] / (_windowSize[0] / 2)
-            _yrp =  _clientPos[1] / (_windowSize[1] / 2)
-            
-            self.hm.MouseMove = self.OnMouseMove
+def get_monitors():
+    retval = []
+    CBFUNC = ctypes.WINFUNCTYPE(ctypes.c_int,
+                                ctypes.c_ulong,
+                                ctypes.c_ulong,
+                                ctypes.POINTER(RECT),
+                                ctypes.c_double)
+    def cb(hMonitor, hdcMonitor, lprcMonitor, dwData):
+        r = lprcMonitor.contents
+        logging.info("cb: %s %s %s %s %s %s %s %s",
+            hMonitor, type(hMonitor),
+            hdcMonitor, type(hdcMonitor),
+            lprcMonitor, type(lprcMonitor),
+            dwData, type(dwData))
+        logging.info("get_monitors() cb: adding %s/%s to data", hMonitor, r.dump())
+        retval.append([hMonitor, r.dump()])
+        return 1
+    cbfunc = CBFUNC(cb)
+    res_ = user.EnumDisplayMonitors(0, 0, cbfunc, 0)
+    return retval
 
-            return False
 
-    if event.MessageName == 'mouse left up':
-        _leftMouseButtonDown = False
-        _windowHandle = 0
-        self.hm.MouseMove = None
-        if _altKeyDown:
-            return False
+def monitor_areas():
+    retval = []
+    monitors = get_monitors()
+    for hMonitor, extents_ in monitors:
+        data = [hMonitor]
+        mi = MONITORINFO()
+        #mi.cbSize = ctypes.sizeof(MONITORINFO)
+        res_ = user.GetMonitorInfoA(hMonitor, ctypes.byref(mi))
+        data.append(mi.rcMonitor.dump())
+        data.append(mi.rcWork.dump())
+        retval.append(data)
+    return retval
 
-    if event.MessageName == 'mouse right up':
-        _rightMouseButtonDown = False
-        _windowHandle = 0
-        self.hm.MouseMove = None
-        if _altKeyDown:
-            return False
 
-    return True
+def islocked():
+    hDesktop = OpenDesktop("default", 0, False, DESKTOP_SWITCHDESKTOP)
+    hDesktop = OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
+    return SwitchDesktop(hDesktop) == 0
 
-  def OnMouseMove(self, event):
-    if _altKeyDown and _leftMouseButtonDown:
-        tbWidth, tbHeight = get_titlebar_size(_windowHandle)
-        xBorder, yBorder = get_border_size(_windowHandle)
-        
-        win32gui.SetWindowPos(
-            _windowHandle,
-            0,
-            event.Position[0] - _clientPos[0] - xBorder,
-            event.Position[1] - _clientPos[1] - (tbHeight + yBorder),
-            0,
-            0,
-            win32con.SWP_NOSIZE)
-    
-    elif _altKeyDown and _rightMouseButtonDown \
-    and win32gui.GetWindowText(_windowHandle) not in _no_resize_window_titles:
-        cx = event.Position[0] - _originalPos[0] 
-        cy = event.Position[1] - _originalPos[1] 
 
-        if _xrp == 0:
-            px = _windowPos[0] + cx
-            sx = _windowSize[0] - cx
+def suppress_alt_if_mousedown(vk, id_, keydown_, mousedown):
+    if vk == "Lmenu":  #TODO: confirm should not test for keyup here?
+        passon = not mousedown
+        if not passon:
+            t = time.time()
+            logging.info(
+                "OKE_Lmenu: suppressing Lmenu key: %s (%s vs. %s)"
+                % (self._last_mouse_move - t, t, self._last_mouse_move))
+
+
+
+class mover(object):
+    def __init__(self):
+        self.xmax_hist = {}
+        self.ymax_hist = {}
+
+        self.hm = pyHook.HookManager()
+
+        # register two callbacks
+        self.hm.MouseAllButtons = self.OnMouseClick
+        self.hm.KeyDown = self.OnKeyboardEvent
+        self.hm.KeyUp = self.OnKeyboardEvent
+
+        # hook into the mouse and keyboard events
+        self.hm.HookMouse()
+        self.hm.HookKeyboard()
+
+        self.monitors = get_monitors()
+        primary_monitor_info()
+
+        #self._ftable = {}
+        self._modifier_down = {
+            "Lwin":      False,
+            "Rwin":      False,
+            "Lcontrol":  False,
+            "Rcontrol":  False,
+            "Lmenu":     False,
+            "Rmenu":     False,
+            "Lshift":    False,
+            "Rshift":    False,
+            "SHIFT":     False,
+            "ALT":       False,
+            "CONTROL":   False,
+            }
+        self._mouse_botton_down = {
+            "L": False,
+            "R": False,
+            "M": False,
+            }
+
+        self._window_handle = 0
+        self._client_pos = None
+
+        self._xrp = None
+        self._yrp = None
+        self._original_pos = None
+        self._window_size = None
+        self._window_pos = None
+
+        self._last_mouse_move = None
+
+        self._keyeventring = []
+
+        self.actions = {
+          "V": [("Lwin",), (self.ymax_currwin,)],
+          "C": [("CONTROL",), (exit,)],
+          }
+        self.modifier_hacks = {
+            "Lmenu":     (self.track_alt, suppress_alt_if_mousedown),
+            "Rmenu":     (self.track_alt,),
+            "Lcontrol":  (self.track_control,),
+            "Rcontrol":  (self.track_control,),
+            "Lshift":    (self.track_shift,),
+            "Rshift":    (self.track_shift,),
+            }
+
+
+    def track_alt(self, vk, id_, keydown, mousedown_):
+        self._modifier_down["ALT"] = keydown
+
+
+    def track_control(self, vk, id_, keydown, mousedown_):
+        self._modifier_down["CONTROL"] = keydown
+
+
+    def track_shift(self, vk, id_, keydown, mousedown_):
+        self._modifier_down["SHIFT"] = keydown
+
+
+    def OnMouseClick(self, event):
+
+        if event.MessageName.startswith("mouse"):
+            #logging.info("mouse event: %s"  % event.MessageName)
+            if event.MessageName.endswith("down"):
+                if event.MessageName == 'mouse left down':
+                    self._mouse_botton_down["L"] = True
+                elif event.MessageName == 'mouse middle down':
+                    self._mouse_botton_down["M"] = True
+                elif event.MessageName == 'mouse right down':
+                    self._mouse_botton_down["R"] = True
+
+                if self._modifier_down["ALT"]:
+
+                    guiti = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+                    user.GetGUIThreadInfo(0, ctypes.byref(guiti))
+                    wi = WINDOWINFO()
+                    wi.cbSize = ctypes.sizeof(WINDOWINFO)
+
+                    win = win32gui.WindowFromPoint(event.Position)
+                    #win = guiti.hwndFocus
+
+                    win = get_top_window(win)
+
+                    user.GetWindowInfo(win, byref(wi))
+
+                    #wp = win32gui.GetWindowPlacement(win)
+                    self._original_pos = event.Position
+                    self._client_pos = win32gui.ScreenToClient(win, self._original_pos)
+                    w_rect = win32gui.GetWindowRect(win)
+                    self._window_size = (w_rect[2] - w_rect[0],
+                                         w_rect[3] - w_rect[1])
+                    self._window_pos = w_rect[0:2]
+
+                    self._xrp =  self._client_pos[0] / (self._window_size[0] / 2)
+                    self._yrp =  self._client_pos[1] / (self._window_size[1] / 2)
+
+                    self._window_handle = win
+                    self.hm.MouseMove = self.OnMouseMove
+
+                    logging.info("moving")
+
+                    return False
+
+            elif event.MessageName.endswith("up"):
+                if event.MessageName == 'mouse left up':
+                    self._mouse_botton_down["L"] = False
+                elif event.MessageName == 'mouse middle up':
+                    self._mouse_botton_down["M"] = False
+                elif event.MessageName == 'mouse right up':
+                    self._mouse_botton_down["R"] = False
+
+                #print win32gui.GetWindowRect(win32gui.GetDesktopWindow())
+                self._window_handle = 0
+                self.hm.MouseMove = None
+                if self._modifier_down["ALT"]:
+                    self._modifier_down["ALT"] = False
+
+        return True
+
+
+    def OnMouseMove(self, event):
+        passon = True
+
+        logging.debug("OnMouseMove: %s %s %s %s" % (self._modifier_down["ALT"],
+                                                    _leftMouseButtonDown,
+                                                    _middleMouseButtonDown,
+                                                    self._mouse_botton_down))
+
+        if (self._modifier_down["ALT"]
+            and
+            (self._mouse_botton_down["L"] or self._mouse_botton_down["M"])):
+            self._last_mouse_move = time.time()
+
+        if self._mouse_botton_down["L"]:
+            win32gui.SetWindowPos(
+                self._window_handle,
+                0,
+                event.Position[0] - self._client_pos[0] - 6,
+                event.Position[1] - self._client_pos[1] - 29,
+                0,
+                0,
+                win32con.SWP_NOSIZE)
+        elif self._mouse_botton_down["M"]:
+            cx = event.Position[0] - self._original_pos[0]
+            cy = event.Position[1] - self._original_pos[1]
+
+            if self._xrp == 0:
+                px = self._window_pos[0] + cx
+                sx = self._window_size[0] - cx
+            else:
+                px = self._window_pos[0]
+                sx = self._window_size[0] + cx
+
+            if self._yrp == 0:
+                py = self._window_pos[1] + cy
+                sy = self._window_size[1] - cy
+            else:
+                py = self._window_pos[1]
+                sy = self._window_size[1] + cy
+
+            win32gui.SetWindowPos(self._window_handle, 0, px, py, sx, sy, 0)
+
+        passon = False
+
+        win32api.SetCursorPos(event.Position)
+
+        return passon
+
+
+    def unpack(self, keyevent):
+        vk = keyevent.GetKey()
+        id = keyevent.KeyID
+        keydown = keyevent.IsTransition() == 0
+        mousedown = (_leftMouseButtonDown or _middleMouseButtonDown or _rightMouseButtonDown)
+        return vk, id, keydown, mousedown
+
+
+    def OnKeyboardEvent(self, event):
+        vk, id, keydown, mousedown = self.unpack(event)
+        passon = True
+
+        self._keyeventring.append(event)
+        if len(self._keyeventring) > 10:
+            self._keyeventring = self._keyeventring[-5:]
+
+        logging.info("got key:\tid:%s\tvk:%s\tkeydown:%s\tmousedown:%s\tmodifiers_down:%s" % (id, vk, keydown, mousedown, self._modifier_down))
+
+        key_frequencies.setdefault(vk, 0)
+        key_frequencies[vk] += 1
+
+        if vk in self._modifier_down:
+            self._modifier_down[vk] = keydown
+            for func in self.modifier_hacks.get(vk, []):
+                func(vk, id, keydown, mousedown)
+
+        if vk in self.actions:
+            modifiers_required, funcs = self.actions[vk]
+            vk, id, keydown, mousedown = self.unpack(event)
+            passon = True
+
+            for func in funcs:
+                modifiers_have = [self._modifier_down.get(m, False) for m in modifiers_required]
+                if keydown and all(modifiers_have):
+                    passon = passon and func(event)
+
+        return passon
+
+
+    def OnKeyboardEvent_Lmenu(self, event):
+        vk_, id_, keydown, mousedown = self.unpack(event)
+        t = time.time()
+        #passon = not (mousedown or t - _lastMouseMoveTrapped < 5.0)
+
+        passon = not mousedown
+        #passon = True
+
+        self._modifier_down["ALT"] = keydown
+        if not passon:
+            logging.info("OKE_Lmenu: suppressing Lmenu key: %s (%s vs. %s)",
+                         self._last_mouse_move - t, t, self._last_mouse_move)
+        return passon
+
+    def OnKeyboardEvent_Lshift(self, event):
+        vk_, id_, keydown, mousedown = self.unpack(event)
+        passon = True
+        self._modifier_down["SHIFT"] = keydown
+        return passon
+
+    def OnKeyboardEvent_Rshift(self, event):
+        return self.OnKeyboardEvent_Lshift(event)
+
+    def OnKeyboardEvent_Lcontrol(self, event):
+        vk_, id_, keydown, mousedown = self.unpack(event)
+        passon = True
+        self._modifier_down["CTRL"] = keydown
+
+        if self._modifier_down["CTRL"]:
+          elapsed = time.clock()
+          if elapsed - self._last_down_times.get("control", -100) < 1:
+            logging.info("double-Control pressed")
+            elapsed = -100
+          self._last_down_times["control"] = elapsed
+
+        return passon
+
+    def OnKeyboardEvent_Rcontrol(self, event):
+        return self.OnKeyboardEvent_Lcontrol(event)
+
+    def OnKeyboardEvent_Lwin(self, event):
+        vk, id, keydown, mousedown = self.unpack(event)
+        passon = True
+        if not keydown:
+            #logging.info("got Win/Super: %s %s" % (vk, keydown))
+            pass
+        self._modifier_down["SUPER"] = keydown
+        return passon
+
+    def OnKeyboardEvent_Rwin(self, event):
+        return self.OnKeyboardEvent_Lwin(event)
+
+    def OnKeyboardEvent_W(self, event):
+      orig_wallpaper=win32gui.SystemParametersInfo(Action=win32con.SPI_GETDESKWALLPAPER)
+      logging.debug('Original: %s' % orig_wallpaper)
+      for bmp in glob.glob(os.path.join(os.environ['windir'],'*.bmp')):
+        logging.debug(bmp)
+        win32gui.SystemParametersInfo(win32con.SPI_SETDESKWALLPAPER, Param=bmp)
+        logging.debug(win32gui.SystemParametersInfo(Action=win32con.SPI_GETDESKWALLPAPER))
+        time.sleep(1)
+
+      win32gui.SystemParametersInfo(win32con.SPI_SETDESKWALLPAPER, Param=orig_wallpaper)
+
+    def OnKeyboardEvent_V(self, event):
+        vk, id, keydown, mousedown = self.unpack(event)
+        passon = True
+        #if self._modifier_down["SUPER"] and keydown:
+        if self._modifier_down["ALT"] and self._modifier_down["CTRL"] and keydown:
+            self.ymax_currwin(event, self._modifier_down["SHIFT"])
+            passon = False
+        return passon
+
+    def OnKeyboardEvent_H(self, event):
+        vk, id, keydown, mousedown = self.unpack(event)
+        passon = True
+
+        if self._modifier_down["ALT"] and self._modifier_down["CTRL"] and keydown:
+            self.xmax_currwin(event, self._modifier_down["SHIFT"])
+            passon = False
+
+        return passon
+
+    def OnKeyboardEvent_F(self, event):
+        vk, id, keydown, mousedown = self.unpack(event)
+        passon = True
+
+        if self._modifier_down["ALT"] and self._modifier_down["CTRL"] and keydown:
+            dump_keyfreqs()
+            passon = False
+
+        return passon
+
+    def OnKeyboardEvent_Q(self, event):
+        vk, id, keydown, mousedown = self.unpack(event)
+        passon = True
+
+        if self._modifier_down["ALT"] and self._modifier_down["CTRL"] and keydown:
+            exit()
+            passon = False
+
+        return passon
+
+    def OnKeyboardEvent_E(self, event):
+        vk, id, keydown, mousedown = self.unpack(event)
+        passon = True
+
+        if self._modifier_down["ALT"] and self._modifier_down["CTRL"] and keydown:
+            self.focus_window(title="emacs", bring_to_front=True)
+            passon = False
+
+        return passon
+
+
+    def focus_window(self, title=None, bring_to_front=False):
+        # TODO: implement
+        pass
+
+
+    def ymax_currwin(self, event, onlyEnd=False):
+        mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+        guiti = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+        user.GetGUIThreadInfo(0, ctypes.byref(guiti))
+        wi = WINDOWINFO()
+        wi.cbSize = ctypes.sizeof(WINDOWINFO)
+        win = guiti.hwndFocus
+        user.GetWindowInfo(win, byref(wi))
+
+        win = get_top_window(win)
+
+        winr = RECT()
+        user.GetWindowRect(win, ctypes.byref(winr))
+        hMonitor = user.MonitorFromRect(ctypes.byref(winr), 0)
+        res = user.GetMonitorInfoA(hMonitor, ctypes.byref(mi))
+
+        curheight = winr.bottom - winr.top
+        abstop = 0
+        absbottom = mi.rcWork.bottom
+        newtop = abstop
+        newbottom = absbottom
+        #newheight = oldheight + (absbottom - winr.bottom)
+
+        uFlags = win32con.SWP_ASYNCWINDOWPOS | win32con.SWP_NOACTIVATE
+
+        if self.ymax_hist.has_key(win):
+            oldr = self.ymax_hist[win]
+            newtop = oldr.top
+            newbottom = oldr.bottom
+            del self.ymax_hist[win]
         else:
-            px = _windowPos[0]
-            sx = _windowSize[0] + cx
+            self.ymax_hist[win] = winr
+            if onlyEnd:
+                uFlags |= win32con.SWP_NOMOVE
+                newtop = winr.top
 
-        if _yrp == 0:
-            py = _windowPos[1] + cy
-            sy = _windowSize[1] - cy
+        width = winr.right - winr.left
+        newheight = newbottom - newtop
+
+        res = win32gui.SetWindowPos(win, 0, winr.left, newtop, width, newheight, uFlags)
+
+        logging.info("ymax info: %s, %s, %s, %s, %s"
+                     % (res, winr.dump(), mi.rcWork.dump(), curheight, newheight))
+
+
+    def xmax_currwin(self, event, spanMonitors=True, onlyEnd=False):
+        mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+        guiti = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+        user.GetGUIThreadInfo(0, ctypes.byref(guiti))
+        wi = WINDOWINFO()
+        wi.cbSize = ctypes.sizeof(WINDOWINFO)
+        win = guiti.hwndFocus
+        user.GetWindowInfo(win, byref(wi))
+
+        win = get_top_window(win)
+
+        winr = RECT()
+        user.GetWindowRect(win, ctypes.byref(winr))
+        hMonitor = user.MonitorFromRect(ctypes.byref(winr), 0)
+        res = user.GetMonitorInfoA(hMonitor, ctypes.byref(mi))
+
+        curwidth = winr.right - winr.left
+        absleft = mi.rcWork.left
+        absright = mi.rcWork.right
+        if spanMonitors:
+            res = user.GetMonitorInfoA(self.monitors[0][0], ctypes.byref(mi))
+            absleft = mi.rcWork.left
+            res = user.GetMonitorInfoA(self.monitors[-1][0], ctypes.byref(mi))
+            absright = mi.rcWork.right
+        newleft = absleft
+        newright = absright
+
+        uFlags = win32con.SWP_ASYNCWINDOWPOS | win32con.SWP_NOACTIVATE
+
+        if self.xmax_hist.has_key(win):
+            oldr = self.xmax_hist[win]
+            newleft = oldr.left
+            newright = oldr.right
+            del self.xmax_hist[win]
         else:
-            py = _windowPos[1]
-            sy = _windowSize[1] + cy
+            self.xmax_hist[win] = winr
+            if onlyEnd:
+                uFlags |= win32con.SWP_NOMOVE
+                newleft = winr.left
 
-        win32gui.SetWindowPos(_windowHandle, 0, px, py, sx, sy, 0)
+        newwidth = newright - newleft
+        height = winr.bottom - winr.top
 
-    win32api.SetCursorPos(event.Position)
+        res = win32gui.SetWindowPos(win, 0, newleft, winr.top, newwidth, height, uFlags)
 
-    return False
+        logging.info("xmax info: %s, %s, %s, %s, %s, %s",
+                     res, winr.dump(), mi.rcWork.dump(), curwidth, newwidth, absleft)
 
-  def OnKeyboardAll(self, event):
-    print "%x - %s" % (event.KeyID, chr(event.Ascii))
-    return True
 
-  def OnKeyboardEvent(self, event):
-    if event.KeyID == 164:
-        global _altKeyDown
+def exit(*args, **kwargs):
+    try:
+        dump_keyfreqs()
+    finally:
+        import os
+        os._exit(1)
 
-        if _altKeyDown and (_leftMouseButtonDown or _rightMouseButtonDown):
-            _altKeyDown = event.Transition == 0
-            return False
 
-        _altKeyDown = event.Transition == 0
-    
-    # return True to pass the event to other handlers
-    # return False to stop the event from propagating    
-    return True
-
-try:
-    x = mover()
-    msg = wintypes.MSG()
-    while user32.GetMessageA(byref(msg), None, 0, 0) != 0:
-        user32.TranslateMessage(byref(msg))
-        user32.DispatchMessageA(byref(msg))
-
-finally:
-    pass
+if __name__ == "__main__":
+    try:
+        mover()
+        pythoncom.PumpMessages()
+    except KeyboardInterrupt, e:
+        logging.info("KeyboardInterrupt - exiting")
+        exit()
+    else:
+        logging.info("finally")
